@@ -2,7 +2,11 @@ import os
 import pyodbc
 import requests
 import ast
-import region_lists
+import regions_dict
+import allRegions
+from allRegions import all_regions_dict
+import pandas as pd
+
 
 
 def all_market_data(type_id):
@@ -16,11 +20,38 @@ def execute_query(server, database, query, params):
         f"Server={server};"
         f"Database={database};"
         f"Trusted_Connection=yes;"
+
     )
+    print(conn_str)
     try:
         with pyodbc.connect(conn_str) as conn:
             with conn.cursor() as cursor:
                 cursor.execute(query, params or ())
+                result = cursor.fetchall()
+                return [row for row in result]  # convert rows to tuples
+    except pyodbc.Error as e:
+        print(f"Database error: {e}")
+        return []
+
+
+def execute_dynamic_query(server, database, query):
+    # conn_str = (
+    #     f"Driver={{ODBC Driver 17 for SQL Server}};"
+    #     f"Server={server};"
+    #     f"Database={database};"
+    #     f"Trusted_Connection=yes;"
+    # )
+    conn_str = (
+        f"Driver={{ODBC Driver 17 for SQL Server}};"
+        f"Server={server};"
+        f"Database={database};"
+        f"Trusted_Connection=yes;"
+    )
+    print(conn_str)
+    try:
+        with pyodbc.connect(conn_str) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query or ())
                 result = cursor.fetchall()
                 return [row for row in result]  # convert rows to tuples
     except pyodbc.Error as e:
@@ -50,8 +81,6 @@ def get_esi_type_id_price(type_id, region_id=10000002):
 
 def get_file_name():
     file_name_string = input('Enter file name with extension: ')
-    # print('dynamic naming disabled in debug')
-    # file_name_string = 'allNoduleHistoriesJita.csv'
     return file_name_string
 
 
@@ -202,11 +231,11 @@ def get_active_type_ids(region_id):
         if response.status_code == 200:
             active_type_ids.extend(response.json())
         else:
-            print(f"Failed to fetch page {page}: {response.status_code}")
+            print(f"failed at {page}: {response.status_code}")
             break
     print(len(active_type_ids), " active types found")
-    # print(active_type_ids)
     return active_type_ids
+
 
 def get_names_for_ids(type_ids):
     query_template = """
@@ -218,15 +247,69 @@ def get_names_for_ids(type_ids):
     query = query_template.format(ids_string)
 
     # Database connection details
+    # server = current_server
+    # database = current_db
+
     server = 'localhost'
-    database = 'eve.SDEmount.full.09202024'
-
-
-    try:
+    database = 'eve.SDEmount.full.09202024' # if you swap to the 0104.current need to check
+    try:                                        # encryption option for SMSS ODBC driver
         result = execute_query(server, database, query)
         return result
-    except Exception as e:
-        print(f"Error fetching names for IDs: {e}")
+    except Exception as error:
+        print(f"Error fetching names for IDs: {error}")
         return []
 
-# func_enum()
+
+def region_input():
+    try:
+        for key, value in regions_dict.items():
+            print(f"{key}: {value}")
+        region_choice = input("Enter name of region ")
+        region_choice_value = regions_dict[region_choice]
+        print(region_choice_value, " picked")
+        return region_choice_value, region_choice
+    except KeyError:
+        print("Invalid region name, attention to details is important")
+        return
+
+
+def deduplicate_list(lst):
+    return list(dict.fromkeys(lst))
+
+
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def fetch_price_multithread(type_id, region_id=10000002):
+
+    base_url = f"https://esi.evetech.net/latest/markets/{region_id}/orders/"
+    query_params = {
+        'datasource': 'tranquility',
+        'order_type': 'sell',
+        'page': 1,
+        'type_id': type_id
+    }
+
+    try:
+        response = requests.get(base_url, params=query_params, timeout=5)
+        response.raise_for_status()
+        orders = response.json()
+        return type_id, min(order['price'] for order in orders) if orders else None
+    except (requests.RequestException, ValueError) as e:
+        print('error')
+        return type_id, None
+
+
+def get_esi_type_id_prices_multithread(type_ids, region_id=10000002, max_workers=10):
+
+    prices = {}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_type_id = {executor.submit(fetch_price_multithread, type_id, region_id): type_id for type_id in type_ids}
+        for future in as_completed(future_to_type_id):
+            type_id, price = future.result()
+            prices[type_id] = price
+
+    return prices
+
