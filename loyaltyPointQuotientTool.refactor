@@ -1,0 +1,481 @@
+import pyodbc
+import type_id_lists
+import ESItutils
+import datetime
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
+from decimal import Decimal
+server = "DESKTOP-2I8ID1K\\MSSQLSERVER01"
+database = "eveSDE.full.01042025"
+conn_str = f"Driver={{ODBC Driver 17 for SQL Server}};Server={server};Database={database};Trusted_Connection=yes;"
+import pandas as pd
+import tkDfDisplay
+
+
+def display_last_five_per_id(df):
+    print(df.sort_values(['bp_id', 'date'], ascending=[True, False]).groupby('bp_id').head(5))
+
+
+def menu_display(menu_dict, final_result):
+    for key, value in menu_dict.items():
+        print(key, value)
+    choice = int(input('pick a number'))
+    function_dict[choice](final_result)
+
+
+def temp_main():
+    # Configure Pandas display options
+    pd.set_option("display.max_rows", None)  # Show all rows
+    pd.set_option("display.max_columns", None)  # Show all columns
+    pd.set_option("display.expand_frame_repr", False)  # Prevent wrapping in Jupyter
+
+    # get user input and identify type_id category
+    ids_choice = type_ids_input()
+    types_dict = type_id_identifier(ids_choice)
+
+    # assign type_id path
+    normalized_types_array = type_id_path_builder(types_dict)
+    ibp, iil, ibpril, iirb, remainder_types = normalized_types_array
+
+    # build mats infex and market package
+    mats_array_index = mats_array_index_builder(ibp, iirb)
+    market_package = iil + ibpril + remainder_types + mats_array_index
+
+    # get market history and lp costs
+    market_frame = get_multiple_market_histories_parallel(market_package, 10000002, max_threads=20)
+    bp_package = ibp + iirb
+    loyalty_frame = get_lp_table_costs(bp_package)
+
+    # crosswalk the mats_ids to corresponding items and do the corresponding bill of materials
+    mats_bom_frame = mats_to_type_id_df(ibp, iirb)
+    mats_bom_frame = bom_bp_conversion(mats_bom_frame)
+
+    # create type_id to bo_id bridge and calculate lp quotient
+    bridged_df = create_bp_bridge(mats_bom_frame, market_frame, loyalty_frame)
+    final_result = calculate_lp_quotient(bridged_df, mats_bom_frame, market_frame)
+
+    # Dispatch results to the menu
+    dispatch_menu(final_result)
+
+
+def type_ids_input():
+    list_names = {
+        name: value for name, value in vars(type_id_lists).items()
+        if isinstance(value, list) and not name.startswith("__")
+    }
+    if not list_names:
+        print("no lists found in source module")
+        return []
+    print("lists:", ", ".join(list_names.keys()))
+    while True:
+        choice = input("pick a list: ").strip()
+        if choice in list_names:
+            return ESItutils.deduplicate_list(list_names[choice])
+        else:
+            print(f"invalid: '{choice}'. try again.")
+
+
+def type_id_identifier(type_id_list):
+    results = {}
+    ids = ",".join("?" for _ in type_id_list)  # Generate correct number of placeholders
+    query = f"""
+        SELECT invTypes.typeID, ic.categoryID
+        FROM invTypes
+        LEFT JOIN invGroups ig ON invTypes.groupID = ig.groupID
+        LEFT JOIN invCategories ic ON ig.categoryID = ic.categoryID
+        WHERE invTypes.typeID IN ({ids})
+    """
+    try:
+        with pyodbc.connect(conn_str) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, type_id_list)
+                rows = cursor.fetchall()
+                results = {type_id: [categoryID] for type_id, categoryID in rows if categoryID is not None}
+
+    except pyodbc.Error as e:
+        print(f"Database error: {e}")  # Consider logging instead of printing
+
+    return results
+
+
+def type_id_path_builder(id_dict):  # ok
+    print('received', id_dict)
+    incoming_bp_list = []
+    for cid in id_dict:
+        if id_dict[cid][0] == 9:  # its a blueprint
+            incoming_bp_list.append(cid)
+    incoming_bp_related_item = []
+    for item in incoming_bp_list:
+        query = """SELECT iap.productTypeID
+                    FROM industryActivityProducts iap
+                    WHERE typeID = ?"""
+        with pyodbc.connect(conn_str) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (item,))
+                row = cursor.fetchone()
+                if row:
+                    incoming_bp_related_item.append(row[0])
+    incoming_item_list = []
+    leftover_item_list = []
+    for cid in id_dict:
+        if cid not in incoming_bp_list:
+            incoming_item_list.append(cid)
+    incoming_item_related_bp = []
+    for item in incoming_item_list:
+        query = """SELECT iap.typeID
+                    FROM industryActivityProducts iap
+                    WHERE productTypeID = ?"""
+        with pyodbc.connect(conn_str) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (item,))
+                row = cursor.fetchone()
+                if row:
+                    incoming_item_related_bp.append(row[0])
+                if not row:
+                    leftover_item_list.append(item)
+
+    return incoming_bp_list, incoming_bp_related_item, incoming_item_list, incoming_item_related_bp, leftover_item_list
+
+
+def create_bp_bridge(mats_bom_frame, market_frame, lp_table):
+    bp_bridge_df = mats_bom_frame[['type_id', 'productTypeID']].drop_duplicates()
+    merged_market_df = bp_bridge_df.merge(  # merge market frame on productTypeID
+        market_frame, left_on="productTypeID", right_on="type_id", how="left", suffixes=("_bp", "_market")
+    )
+    merged_lp_df = bp_bridge_df.merge(  # merge lp df on type_id
+        lp_table, left_on="type_id", right_on="type_id", how="left", suffixes=("_bp", "_lp")
+    )
+    # Step 3: Merge LP Data on type_id (bp_id)
+    print("Market DF Columns:", merged_market_df.columns)
+    print("LP DF Columns:", merged_lp_df.columns)
+    merged_market_df = merged_market_df.rename(
+        columns={"type_id_bp": "bp_id", "type_id_market": "type_id"})  # rename the bp_id col - fix this later
+    merged_lp_df = merged_lp_df.rename(columns={"type_id": "bp_id"})
+    final_df = merged_market_df.merge(merged_lp_df, on="bp_id", how="left")  # combine marketframe and lp frame
+
+    return final_df
+
+
+def calculate_lp_quotient(final_df, mats_bom_frame, market_frame):
+    mats_bom_frame = mats_bom_frame.merge(
+        market_frame[["type_id", "average", "date"]],
+        left_on=["materialTypeID"],
+        right_on=["type_id"],
+        how="left",
+        suffixes=("_mat", "_market")
+    )
+    missing_prices = mats_bom_frame[mats_bom_frame["average"].isna()]
+    if not missing_prices.empty:
+        print("\n⚠Missing Market Prices for These Materials (Filling with 0):\n", missing_prices)  # should maybe crash
+        mats_bom_frame["average"] = mats_bom_frame["average"].fillna(0)
+    mats_bom_frame["materialQty"] = pd.to_numeric(mats_bom_frame["materialQty"], errors="coerce").fillna(0)
+    mats_bom_frame["material_cost"] = mats_bom_frame["average"] * mats_bom_frame["materialQty"]
+    mats_bom_frame[["materialTypeID", "average", "materialQty", "material_cost", "date"]].head()
+    total_material_costs = mats_bom_frame.groupby(["type_id_mat", "date"])['material_cost'].sum().reset_index()
+    total_material_costs = total_material_costs.rename(
+        columns={"type_id_mat": "bp_id", "material_cost": "total_material_cost"})
+    final_df = final_df.merge(total_material_costs, on=["bp_id", "date"], how="left")
+    final_df["total_material_cost"] = final_df["total_material_cost"].fillna(0)
+    final_df["lp_quotient"] = (final_df["average"] - final_df["total_material_cost"] - final_df["isk_cost"]) / final_df[
+        "lp_cost"]
+    decimal_columns = ['average', 'highest', 'lowest', 'isk_cost', 'total_material_cost', 'lp_quotient']
+    final_df[decimal_columns] = final_df[decimal_columns].applymap(lambda x: Decimal(str(x)))
+    return final_df
+
+
+def mats_array_index_builder(listOne, listTwo):  # this is duplicated in a gross way, refactor # ok
+    complete_bp_list = listOne + listTwo
+    unique_material_type_ids = set()  # Set to avoid duplicates
+    for typeID in complete_bp_list:
+        query = """SELECT iam.materialTypeID
+                 FROM industryActivityMaterials iam
+                 LEFT JOIN invTypes it ON iam.materialTypeID = it.typeID
+                 WHERE iam.typeID = ?"""
+        try:
+            with pyodbc.connect(conn_str) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(query, (typeID,))
+                    rows = cursor.fetchall()
+                    if rows:
+                        for row in rows:
+                            row = row[0]
+                            unique_material_type_ids.add(row)  # No duplication
+        except pyodbc.Error as e:
+            print(f"Database error: {e}")
+    for item in unique_material_type_ids:
+        print('found unique mats id: ', item)
+    return list(unique_material_type_ids)  # Convert set to list before returning
+
+
+def mats_to_type_id_df(listOne, listTwo):
+    bom_data = []
+    complete_bp_list = listOne + listTwo
+    query = """SELECT iam.typeID, iam.materialTypeID, iam.quantity
+               FROM industryActivityMaterials iam
+               WHERE typeID = ?"""
+    try:
+        with pyodbc.connect(conn_str) as conn:
+            with conn.cursor() as cursor:
+                for typeID in complete_bp_list:
+                    cursor.execute(query, (typeID,))
+                    rows = cursor.fetchall()
+                    if rows:
+                        for row in rows:
+                            bom_data.append({"type_id": row[0], "materialTypeID": row[1], "materialQty": row[2]})
+        bom_df = pd.DataFrame(bom_data, columns=["type_id", "materialTypeID", "materialQty"])
+
+        return bom_df
+
+    except pyodbc.Error as e:
+        return pd.DataFrame(columns=["type_id", "materialTypeID", "materialQty"])
+
+
+def bom_bp_conversion(mats_bom_frame):  # needed
+    query = """SELECT iap.productTypeID FROM industryActivityProducts iap WHERE typeID = ?"""
+    mats_bom_frame["productTypeID"] = None
+    with pyodbc.connect(conn_str) as conn:
+        with conn.cursor() as cursor:
+            for idx, row in mats_bom_frame.iterrows():
+                type_id = row["type_id"]
+                cursor.execute(query, (type_id,))
+                fetched_row = cursor.fetchone()
+                if fetched_row:
+                    mats_bom_frame.at[idx, "productTypeID"] = fetched_row[0]
+
+    return mats_bom_frame
+
+
+def merge_mats_bom_to_market_frame(mats_bom_frame, market_frame):  # bad
+    merged_df = market_frame.merge(mats_bom_frame, left_on="type_id", right_on="productTypeID", how="left")
+    return merged_df
+
+
+def get_multiple_market_histories_parallel(type_ids, region_id, max_threads=20):
+    histories = {}
+    start_time = datetime.now()
+    with ThreadPoolExecutor(max_threads) as executor:
+        future_to_type_id = {
+            executor.submit(get_market_history, type_id, region_id): type_id
+            for type_id in type_ids
+        }
+        for counter, future in enumerate(as_completed(future_to_type_id), start=1):  # create enumerate(
+            type_id = future_to_type_id[future]
+            try:
+                histories[type_id] = future.result()
+                print(
+                    f"Fetched {counter}/{len(type_ids)}: TypeID {type_id} in Region {region_id} | Time: {datetime.now() - start_time}")
+            except Exception as e:
+                print(f"Failed to fetch TypeID {type_id}: {e}")
+    market_df = json_to_dataframe(histories)
+    print(market_df)
+
+    return market_df
+
+
+def get_market_history(type_id, region_id=10000002):
+    url = f"https://esi.evetech.net/latest/markets/{region_id}/history/?type_id={type_id}"
+    response = requests.get(url)
+    response.raise_for_status()
+
+    return response.json()
+
+
+def calculate_material_costs(market_history, industry_materials):
+    material_costs = {}
+    for type_id, materials in industry_materials.items():
+        total_cost = 0
+        for material in materials:  # materials contain materialTypeID and quantity
+            material_id = material["materialTypeID"]
+            quantity = material["quantity"]
+            if material_id in market_history:
+                avg_price = market_history[material_id][-1]["average"]  # Use most recent price
+                total_cost += avg_price * quantity
+        material_costs[type_id] = total_cost
+
+    return material_costs
+
+
+def get_lp_table_costs(bp_package):
+    if not bp_package:
+        return pd.DataFrame(columns=["type_id", "lp_cost", "isk_cost"])  # Return empty DataFrame if no input
+
+    query = """
+        SELECT type_id, lp_cost, isk_cost
+        FROM lpOffers2025
+        WHERE type_id IN ({})
+        AND isk_cost > 0
+    """.format(",".join("?" for _ in bp_package))
+
+    try:
+        with pyodbc.connect(conn_str) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, bp_package)
+                rows = cursor.fetchall()
+            processed_rows = [list(row) for row in rows]
+
+        return pd.DataFrame(processed_rows,
+                            columns=["type_id", "lp_cost", "isk_cost"]) if processed_rows else pd.DataFrame(
+            columns=["type_id", "lp_cost", "isk_cost"])
+    except pyodbc.Error as e:
+        print(f"Database error: {e}")
+
+        return pd.DataFrame(columns=["type_id", "lp_cost", "isk_cost"])
+
+
+def json_to_dataframe(json_data):
+    if not json_data:
+        print("no / bad json")
+
+        return None
+    rows = []
+    for type_id, histories in json_data.items():
+        if not isinstance(histories, list):
+            print(f"Skipping type_id {type_id} with unexpected structure: {histories}")
+            continue
+        for record in histories:
+            if isinstance(record, dict):
+                record["type_id"] = type_id  # Add type_id to each record
+                rows.append(record)
+            else:
+                print(f"Skipping invalid record for type_id {type_id}: {record}")
+    if rows:
+        df = pd.DataFrame(rows)
+        print(f"created df  {len(df)} rows and {len(df.columns)} columns.")
+
+        return df
+    else:
+        print("no rows added.")
+
+        return None
+
+
+def print_three_months_history(df):
+    if df.empty:
+        print("Empty DataFrame.")
+        return
+
+    df["date"] = pd.to_datetime(df["date"])
+    three_months_ago = pd.to_datetime("today") - pd.DateOffset(months=3)
+    df_filtered = df[df["date"] >= three_months_ago]
+    df_sorted = df_filtered.sort_values(["bp_id", "date"], ascending=[True, False])
+    latest_df = df_sorted.groupby("bp_id").head(90)  # Get most recent 90 rows per bp_id
+
+    print("\nLast Three Months LP Quotient History for Each bp_id:")
+    print(latest_df)
+
+    tkDfDisplay.launch_viewer(latest_df)
+
+def print_most_recent_lp_quotient(df):
+    if df.empty:
+        print("enpty df.")
+
+        return
+    df["date"] = pd.to_datetime(df["date"])
+    df_sorted = df.sort_values(["bp_id", "date"], ascending=[True, False])
+    latest_df = df_sorted.groupby("bp_id").first().reset_index()
+    print("\nMost Recent lp_quotient for Each bp_id:")
+    for _, row in latest_df.iterrows():
+        most_recent = f"bp_id: {row['bp_id']}, lp_quotient: {row['lp_quotient']}, Date: {row['date']}"
+        # print(most_recent)
+        # print(f"{most_recent:,.2f}")
+        tkDfDisplay.launch_viewer(latest_df)
+
+def print_summary_statistics(df):
+    print("df summary: ")
+    print(df.describe())
+
+
+def filter_lp_quotient_threshold(df, threshold):
+    filtered_df = df[df["lp_quotient"] > threshold]
+    print(f"Items with lp_quotient greater than {threshold}:")
+    print(filtered_df[["bp_id", "lp_quotient", "date"]])
+
+
+def dispatch_menu(df):
+    menu_options = {
+        "1": ("Print most recent lp_quotient for each item", print_most_recent_lp_quotient),
+        "2": ("Show summary statistics", print_summary_statistics),
+        "3": ("Filter items by lp_quotient threshold", filter_lp_quotient_threshold),
+        "4": ("Print three months' history for selected ids", print_three_months_history),
+        "5": ("Exit", None)
+    }
+
+    while True:
+        print("\nMenu Options:")
+        for key, (desc, _) in menu_options.items():
+            print(f"{key}: {desc}")
+
+        choice = input("Select an option: ").strip()
+
+        if choice == "5":
+            print("Exiting menu.")
+            break
+
+        if choice in menu_options:
+            func = menu_options[choice][1]
+            if func:
+                if choice == "3":
+                    try:
+                        threshold = float(input("Enter lp_quotient threshold: "))
+                        func(df, threshold)
+                    except ValueError:
+                        print("Invalid input. Please enter a numeric value.")
+                else:
+                    func(df)
+        else:
+            print("Invalid choice. Please select a valid option.")
+
+
+category_dict = {
+    0: "#System",
+    1: "Owner",
+    2: "Celestial",
+    3: "Station",
+    4: "Material",
+    5: "Accessories",
+    6: "Ship",
+    7: "Module",
+    8: "Charge",
+    9: "Blueprint",
+    10: "Trading",
+    11: "Entity",
+    14: "Bonus",
+    16: "Skill",
+    17: "Commodity",
+    18: "Drone",
+    20: "Implant",
+    22: "Deployable",
+    23: "Starbase",
+    24: "Reaction",
+    25: "Asteroid",
+    26: "WorldSpace",
+    29: "Abstract",
+    30: "Apparel",
+    32: "Subsystem",
+    34: "Ancient Relics",
+    35: "Decryptors",
+    39: "Infrastructure Upgrades",
+    40: "Sovereignty Structures",
+    41: "Planetary Industry",
+    42: "Planetary Resources",
+    43: "Planetary Commodities",
+    46: "Orbitals",
+    49: "Placeables",
+    53: "Effects",
+    54: "Lights",
+    59: "Cells",
+    63: "Special Edition Assets",
+    65: "Structure",
+    66: "Structure Module",
+    87: "Fighter",
+    91: "SKINs",
+    2100: "Expert Systems",
+    2107: "Mining",
+    2118: "Personalization",
+    2143: "Colony Resources",
+    350001: "Infantry"
+}
+# type_id_identifier(test_list)
+
+temp_main()
